@@ -1,0 +1,37 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    container_name: nova_commerce_api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/nova_commerce
+      - SECRET_KEY=super-secret-dev-key-change-in-production
+      - DEBUG=True
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+
+  db:
+    image: postgres:15-alpine
+    container_name: nova_commerce_db
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=nova_commerce
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d nova_commerce"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
