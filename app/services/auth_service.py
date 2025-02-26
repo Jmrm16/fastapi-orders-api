@@ -41,3 +41,4 @@ def decode_access_token(token: str) -> Optional[dict[str, Any]]:
         return payload
     except JWTError:
         return None
+
