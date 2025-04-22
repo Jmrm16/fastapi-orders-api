@@ -87,3 +87,4 @@ def update_product(
     db.refresh(product)
     return product
 
+
