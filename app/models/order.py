@@ -48,3 +48,4 @@ class OrderItem(Base):
     @property
     def subtotal(self) -> float:
         return round(self.quantity * self.unit_price, 2)
+
