@@ -41,3 +41,4 @@ class OrderResponse(BaseModel):
     items: List[OrderItemResponse] = []
 
     model_config = ConfigDict(from_attributes=True)
+
