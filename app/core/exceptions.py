@@ -28,3 +28,4 @@ class EntityNotFoundException(CommerceException):
     """Raised when a requested resource is missing in the database."""
     def __init__(self, entity_name: str, identifier: str | int):
         super().__init__(f"{entity_name} with ID '{identifier}' not found.")
+
