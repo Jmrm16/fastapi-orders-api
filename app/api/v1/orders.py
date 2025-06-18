@@ -106,3 +106,4 @@ def set_order_status(
     except OrderStateTransitionException as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message)
 
+
