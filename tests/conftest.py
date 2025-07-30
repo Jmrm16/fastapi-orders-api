@@ -103,3 +103,4 @@ def sample_product(db: Session) -> Product:
     db.commit()
     db.refresh(product)
     return product
+
