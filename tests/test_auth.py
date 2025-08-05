@@ -55,3 +55,4 @@ def test_read_me_profile(client: TestClient, normal_user, normal_user_token_head
     data = resp.json()
     assert data["id"] == normal_user.id
     assert data["email"] == normal_user.email
+
