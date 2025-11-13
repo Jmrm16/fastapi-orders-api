@@ -60,4 +60,3 @@ def test_update_product_stock_admin(client: TestClient, sample_product, admin_to
     data = resp.json()
     assert data["stock"] == 50
     assert data["price"] == 79.99
-

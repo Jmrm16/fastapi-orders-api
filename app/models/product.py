@@ -21,4 +21,3 @@ class Product(Base):
 
     def __repr__(self) -> str:
         return f"<Product id={self.id} sku={self.sku} name={self.name}>"
-

@@ -119,6 +119,3 @@ def test_payment_webhook_marks_order_paid(
     # Verify order status in GET
     get_resp = client.get(f"/api/v1/orders/{order_id}", headers=normal_user_token_headers)
     assert get_resp.json()["status"] == "PAID"
-
-
-

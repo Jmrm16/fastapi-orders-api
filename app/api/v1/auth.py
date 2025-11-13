@@ -68,4 +68,3 @@ def login_for_access_token(
 def read_current_user(current_user: User = Depends(get_current_active_user)):
     """Returns the profile of the currently authenticated user."""
     return current_user
-

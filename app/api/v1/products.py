@@ -86,5 +86,3 @@ def update_product(
     db.commit()
     db.refresh(product)
     return product
-
-
