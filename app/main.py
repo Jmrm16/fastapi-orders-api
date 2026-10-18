@@ -1,3 +1,4 @@
+import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
@@ -62,4 +63,12 @@ def root_info():
 
 
 # Mount API v1
+
+@app.middleware("http")
+async def add_correlation_id(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 app.include_router(api_router, prefix=settings.API_V1_STR)
