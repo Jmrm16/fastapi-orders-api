@@ -45,6 +45,18 @@ async def commerce_exception_handler(request: Request, exc: CommerceException):
     )
 
 
+
+@app.get("/health/db", tags=["Health"])
+def database_health_check():
+    """Validates active database connection pool readiness."""
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"status": "healthy", "database": "connected"}
+    except Exception as exc:
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(exc)})
+
 @app.get("/health", tags=["Health"])
 def health_check():
     """Simple liveness probe for Docker and Kubernetes."""
