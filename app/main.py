@@ -19,6 +19,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
+    description="High-performance e-commerce order management microservice with atomic stock reservation.",
+    version="1.1.0",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",
