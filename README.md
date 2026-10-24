@@ -341,6 +341,9 @@ The application is architected to switch seamlessly between development and prod
 
 ---
 
+## Correlation & Tracing
+Requests support distributed tracing via the `X-Request-ID` header.
+
 ## Testing Architecture & Pytest Fixtures
 
 The test suite in `tests/` contains comprehensive unit and integration tests covering positive paths, business validation rejections, and security barriers.
