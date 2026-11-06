@@ -1,3 +1,4 @@
+import time
 import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
@@ -19,13 +20,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="High-performance e-commerce order management microservice with atomic stock reservation.",
-    version="1.1.0",
+    description="High-performance e-commerce order management microservice with atomic stock reservation and analytics.",
+    version="1.2.0",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+# Production Observability Middleware (Request Tracing & Latency Telemetry)
+@app.middleware("http")
+async def add_telemetry_and_request_id(request: Request, call_next):
+    start_time = time.perf_counter()
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    response = await call_next(request)
+    process_time = time.perf_counter() - start_time
+    response.headers["X-Process-Time"] = f"{process_time:.6f}s"
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 # Configure CORS
 if settings.CORS_ORIGINS:

@@ -36,8 +36,24 @@ class OrderResponse(BaseModel):
     status: OrderStatus
     total_amount: float
     shipping_address: str
+    idempotency_key: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     items: List[OrderItemResponse] = []
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class TopSellingProduct(BaseModel):
+    product_id: int
+    product_name: str
+    units_sold: int
+    total_revenue: float
+
+
+class OrderAnalyticsSummary(BaseModel):
+    total_orders: int
+    total_revenue: float
+    average_order_value: float
+    status_breakdown: dict[str, int]
+    top_selling_products: List[TopSellingProduct] = []

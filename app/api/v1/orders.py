@@ -1,11 +1,20 @@
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, Header
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.user import User
 from app.models.order import Order, OrderStatus
-from app.schemas.order import OrderCreate, OrderResponse, OrderStatusUpdate
-from app.services.order_service import create_order, update_order_status
+from app.schemas.order import (
+    OrderCreate,
+    OrderResponse,
+    OrderStatusUpdate,
+    OrderAnalyticsSummary,
+)
+from app.services.order_service import (
+    create_order,
+    update_order_status,
+    get_order_analytics_summary,
+)
 from app.core.security import get_current_active_user, get_current_admin_user
 from app.core.exceptions import (
     InsufficientStockException,
@@ -19,17 +28,38 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 @router.post("/", response_model=OrderResponse, status_code=status.HTTP_201_CREATED)
 def place_order(
     order_in: OrderCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
-    """Places a new customer order and reserves product inventory."""
+    """
+    Places a new customer order and atomically reserves product inventory.
+    Supports optional 'Idempotency-Key' header for duplicate request protection.
+    """
     try:
-        order = create_order(db=db, user=current_user, order_in=order_in)
+        order = create_order(
+            db=db,
+            user=current_user,
+            order_in=order_in,
+            idempotency_key=idempotency_key,
+        )
         return order
     except EntityNotFoundException as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=exc.message)
     except InsufficientStockException as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message)
+
+
+@router.get("/analytics/summary", response_model=OrderAnalyticsSummary)
+def get_orders_analytics(
+    db: Session = Depends(get_db),
+    _admin: User = Depends(get_current_admin_user),
+):
+    """
+    Computes global business analytics and revenue summary (Administrator only).
+    Calculates total GMV, order volume, status breakdown and top-selling items.
+    """
+    return get_order_analytics_summary(db=db)
 
 
 @router.get("/", response_model=List[OrderResponse])

@@ -291,11 +291,12 @@ Partially updates inventory or pricing.
 ### Order Fulfillment Router (`/api/v1/orders`)
 
 #### `POST /api/v1/orders/`
-Places a new order, calculates subtotals, and atomically deducts stock.
+Places a new order, calculates subtotals, and atomically deducts stock. Supports Stripe-grade duplicate protection via optional `Idempotency-Key` header.
 
 ```bash
 curl -X POST "http://localhost:8000/api/v1/orders/" \
   -H "Authorization: Bearer <TOKEN>" \
+  -H "Idempotency-Key: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d" \
   -H "Content-Type: application/json" \
   -d '{
     "shipping_address": "456 Enterprise Way, Austin, TX",
@@ -307,6 +308,38 @@ curl -X POST "http://localhost:8000/api/v1/orders/" \
 
 #### `GET /api/v1/orders/`
 Returns order history for the authenticated user (or all system orders if admin).
+
+#### `GET /api/v1/orders/analytics/summary` *(Admin Only)*
+Computes financial analytics, Gross Merchandise Value (GMV), average order value (AOV), status breakdown, and top-selling products using optimized SQL aggregations (`func.sum`, `func.count`).
+
+```bash
+curl -X GET "http://localhost:8000/api/v1/orders/analytics/summary" \
+  -H "Authorization: Bearer <ADMIN_TOKEN>"
+```
+
+*Response (200 OK):*
+```json
+{
+  "total_orders": 142,
+  "total_revenue": 18450.75,
+  "average_order_value": 129.93,
+  "status_breakdown": {
+    "PENDING": 12,
+    "PAID": 45,
+    "PROCESSING": 30,
+    "SHIPPED": 50,
+    "CANCELLED": 5
+  },
+  "top_selling_products": [
+    {
+      "product_id": 1,
+      "product_name": "Mechanical Wireless Keyboard",
+      "units_sold": 94,
+      "total_revenue": 8459.06
+    }
+  ]
+}
+```
 
 #### `POST /api/v1/orders/{id}/cancel`
 Cancels an order and automatically restores stock back to product inventory.
