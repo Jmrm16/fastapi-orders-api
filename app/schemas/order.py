@@ -24,22 +24,40 @@ class OrderItemResponse(BaseModel):
 class OrderCreate(BaseModel):
     shipping_address: str = Field(..., min_length=5, max_length=512)
     items: List[OrderItemCreate] = Field(..., min_length=1, description="Order must contain at least one item")
+    coupon_code: Optional[str] = Field(default=None, max_length=32, description="Optional promo code for discount")
 
 
 class OrderStatusUpdate(BaseModel):
     status: OrderStatus
+    notes: Optional[str] = Field(default=None, max_length=500, description="Reason or note for status transition")
+
+
+class OrderEventResponse(BaseModel):
+    id: int
+    order_id: int
+    from_status: Optional[str] = None
+    to_status: str
+    actor: str
+    notes: Optional[str] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OrderResponse(BaseModel):
     id: int
     user_id: int
     status: OrderStatus
+    subtotal: float = 0.0
+    discount_amount: float = 0.0
     total_amount: float
     shipping_address: str
     idempotency_key: Optional[str] = None
+    coupon_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     items: List[OrderItemResponse] = []
+    events: List[OrderEventResponse] = []
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -16,6 +16,8 @@ env/
 # Databases
 *.sqlite3
 *.db
+*.db-shm
+*.db-wal
 
 # Testing & Coverage
 .pytest_cache/

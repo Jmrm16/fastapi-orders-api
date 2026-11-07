@@ -30,14 +30,26 @@ def handle_payment_webhook(payload: PaymentWebhookPayload, db: Session = Depends
 
     if payload.event == "payment.succeeded" and payload.status == "succeeded":
         try:
-            update_order_status(db=db, order=order, new_status=OrderStatus.PAID)
+            update_order_status(
+                db=db,
+                order=order,
+                new_status=OrderStatus.PAID,
+                actor="system:webhook",
+                notes=f"Payment succeeded via {payload.payment_reference}",
+            )
             return {"received": True, "order_status": "PAID"}
         except OrderStateTransitionException as exc:
             return {"received": True, "warning": exc.message}
 
     elif payload.event == "payment.failed":
         try:
-            update_order_status(db=db, order=order, new_status=OrderStatus.CANCELLED)
+            update_order_status(
+                db=db,
+                order=order,
+                new_status=OrderStatus.CANCELLED,
+                actor="system:webhook",
+                notes=f"Payment failed via {payload.payment_reference}",
+            )
             return {"received": True, "order_status": "CANCELLED"}
         except OrderStateTransitionException:
             return {"received": True, "warning": "Order was not cancelled"}

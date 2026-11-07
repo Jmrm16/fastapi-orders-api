@@ -1,17 +1,19 @@
 from typing import List, Tuple, Optional, Dict, Any
 from sqlalchemy import func, desc
 from sqlalchemy.orm import Session
-from app.models.order import Order, OrderItem, OrderStatus
+from app.models.order import Order, OrderItem, OrderStatus, OrderEvent
 from app.models.product import Product
 from app.models.user import User
+from app.models.coupon import Coupon
 from app.schemas.order import OrderCreate
 from app.core.exceptions import (
     InsufficientStockException,
     EntityNotFoundException,
     OrderStateTransitionException,
+    CouponValidationException,
 )
 
-# Allowed order lifecycle transitions
+# Allowed order lifecycle state transitions
 ALLOWED_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.PENDING: {OrderStatus.PAID, OrderStatus.CANCELLED},
     OrderStatus.PAID: {OrderStatus.PROCESSING, OrderStatus.CANCELLED},
@@ -28,14 +30,15 @@ def create_order(
     idempotency_key: Optional[str] = None,
 ) -> Order:
     """
-    Creates a new order atomically:
-    1. Checks idempotency key to prevent double-charging on duplicate requests.
-    2. Validates all requested products exist and have sufficient inventory.
-    3. Decrements product stock.
-    4. Calculates item prices and total.
-    5. Persists the order and order items in a single transaction.
+    Creates an order atomically with race-condition prevention:
+    1. Idempotency check prevents duplicate submission on client retries.
+    2. Validates coupon constraints against the calculated subtotal.
+    3. Atomically reserves product inventory using conditional database updates
+       to strictly prevent overselling under high concurrency.
+    4. Calculates discounts, item breakdowns, and net total.
+    5. Records initial lifecycle audit event.
     """
-    # 1. Idempotency Guard (e.g. Stripe-grade retry protection)
+    # 1. Idempotency Guard
     if idempotency_key:
         existing_order = (
             db.query(Order)
@@ -45,60 +48,121 @@ def create_order(
         if existing_order:
             return existing_order
 
-    # Group and validate requested items
+    # 2. Pre-fetch and validate products exist and are active
     requested_product_ids = [item.product_id for item in order_in.items]
     products = db.query(Product).filter(Product.id.in_(requested_product_ids)).all()
     products_by_id = {p.id: p for p in products}
 
-    # Verify every product exists and is active
     for item in order_in.items:
-        product = products_by_id.get(item.product_id)
-        if not product or not product.is_active:
+        p = products_by_id.get(item.product_id)
+        if not p or not p.is_active:
             raise EntityNotFoundException("Product", item.product_id)
-        if product.stock < item.quantity:
+
+    # 3. Calculate subtotal before discounts
+    subtotal = sum(
+        products_by_id[item.product_id].price * item.quantity
+        for item in order_in.items
+    )
+    subtotal = round(subtotal, 2)
+
+    # 4. Coupon validation and discount calculation
+    coupon: Optional[Coupon] = None
+    discount_amount = 0.0
+    if order_in.coupon_code:
+        coupon = (
+            db.query(Coupon)
+            .filter(Coupon.code == order_in.coupon_code.strip().upper())
+            .first()
+        )
+        if not coupon:
+            raise CouponValidationException(f"Coupon '{order_in.coupon_code}' does not exist")
+        
+        is_valid, reason = coupon.is_valid(subtotal)
+        if not is_valid:
+            raise CouponValidationException(reason)
+
+        discount_amount = coupon.calculate_discount(subtotal)
+        coupon.times_used += 1
+
+    net_total = round(max(0.0, subtotal - discount_amount), 2)
+
+    # 5. Atomic inventory reservation:
+    # Uses conditional UPDATE WHERE stock >= requested to guarantee zero overselling
+    # even under concurrent thread execution.
+    for item in order_in.items:
+        rows_updated = (
+            db.query(Product)
+            .filter(
+                Product.id == item.product_id,
+                Product.stock >= item.quantity,
+                Product.is_active.is_(True),
+            )
+            .update(
+                {Product.stock: Product.stock - item.quantity},
+                synchronize_session="fetch",
+            )
+        )
+        if rows_updated == 0:
+            # Atomic update failed: insufficient inventory
+            current_p = db.query(Product).filter(Product.id == item.product_id).first()
+            avail = current_p.stock if current_p else 0
+            name = current_p.name if current_p else f"Product #{item.product_id}"
             raise InsufficientStockException(
-                product_name=product.name,
-                available=product.stock,
-                requested=item.quantity
+                product_name=name,
+                available=avail,
+                requested=item.quantity,
             )
 
-    # All validations passed; instantiate order
+    # 6. Create order record
     order = Order(
         user_id=user.id,
         status=OrderStatus.PENDING,
+        subtotal=subtotal,
+        discount_amount=discount_amount,
+        total_amount=net_total,
         shipping_address=order_in.shipping_address,
         idempotency_key=idempotency_key,
-        total_amount=0.0,
+        coupon_id=coupon.id if coupon else None,
     )
     db.add(order)
-    db.flush()  # Generates order.id for foreign keys
+    db.flush()
 
-    total = 0.0
+    # 7. Create line items
     for item in order_in.items:
-        product = products_by_id[item.product_id]
-        
-        # Atomically reserve inventory
-        product.stock -= item.quantity
-
+        p = products_by_id[item.product_id]
         order_item = OrderItem(
             order_id=order.id,
-            product_id=product.id,
+            product_id=p.id,
             quantity=item.quantity,
-            unit_price=product.price,
+            unit_price=p.price,
         )
-        total += order_item.subtotal
         db.add(order_item)
 
-    order.total_amount = round(total, 2)
+    # 8. Record audit event
+    creation_event = OrderEvent(
+        order_id=order.id,
+        from_status=None,
+        to_status=OrderStatus.PENDING.value,
+        actor=f"user:{user.id}",
+        notes="Order placed by customer",
+    )
+    db.add(creation_event)
+
     db.commit()
     db.refresh(order)
     return order
 
 
-def update_order_status(db: Session, order: Order, new_status: OrderStatus) -> Order:
+def update_order_status(
+    db: Session,
+    order: Order,
+    new_status: OrderStatus,
+    actor: str = "system",
+    notes: Optional[str] = None,
+) -> Order:
     """
-    Updates the status of an order obeying the state machine.
-    If the order is cancelled, inventory is automatically restored.
+    Transitions order to a new state and writes an immutable audit record.
+    If the order is cancelled, stock is restored and coupon usage decremented.
     """
     if order.status == new_status:
         return order
@@ -107,20 +171,48 @@ def update_order_status(db: Session, order: Order, new_status: OrderStatus) -> O
     if new_status not in allowed:
         raise OrderStateTransitionException(
             current_status=order.status.value,
-            target_status=new_status.value
+            target_status=new_status.value,
         )
 
-    # Restock inventory if cancelled
+    old_status = order.status
+
+    # Restock inventory and revert coupon usage if cancelled
     if new_status == OrderStatus.CANCELLED:
         for item in order.items:
-            product = db.query(Product).filter(Product.id == item.product_id).first()
-            if product:
-                product.stock += item.quantity
+            db.query(Product).filter(Product.id == item.product_id).update(
+                {Product.stock: Product.stock + item.quantity},
+                synchronize_session="fetch",
+            )
+        if order.coupon_id:
+            coupon = db.query(Coupon).filter(Coupon.id == order.coupon_id).first()
+            if coupon:
+                coupon.times_used = max(0, coupon.times_used - 1)
 
     order.status = new_status
+
+    # Record lifecycle transition event
+    audit_event = OrderEvent(
+        order_id=order.id,
+        from_status=old_status.value,
+        to_status=new_status.value,
+        actor=actor,
+        notes=notes or f"Status changed from {old_status.value} to {new_status.value}",
+    )
+    db.add(audit_event)
+
     db.commit()
     db.refresh(order)
     return order
+
+
+def get_order_events(db: Session, order_id: int) -> List[OrderEvent]:
+    """Retrieves full audit log history for an order in chronological order."""
+    return (
+        db.query(OrderEvent)
+        .filter(OrderEvent.order_id == order_id)
+        .order_by(OrderEvent.created_at.asc())
+        .all()
+    )
 
 
 def get_order_analytics_summary(db: Session) -> Dict[str, Any]:
@@ -134,7 +226,6 @@ def get_order_analytics_summary(db: Session) -> Dict[str, Any]:
     """
     total_orders = db.query(func.count(Order.id)).scalar() or 0
 
-    # Non-cancelled revenue
     revenue_res = (
         db.query(func.coalesce(func.sum(Order.total_amount), 0.0))
         .filter(Order.status != OrderStatus.CANCELLED)
@@ -152,7 +243,6 @@ def get_order_analytics_summary(db: Session) -> Dict[str, Any]:
         round(total_revenue / valid_orders_count, 2) if valid_orders_count > 0 else 0.0
     )
 
-    # Status breakdown
     status_counts = (
         db.query(Order.status, func.count(Order.id))
         .group_by(Order.status)
@@ -163,7 +253,6 @@ def get_order_analytics_summary(db: Session) -> Dict[str, Any]:
         status_key = st.value if hasattr(st, "value") else str(st)
         status_breakdown[status_key] = count
 
-    # Top selling products
     top_products_query = (
         db.query(
             Product.id,

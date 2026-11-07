@@ -28,3 +28,10 @@ class EntityNotFoundException(CommerceException):
     """Raised when a requested resource is missing in the database."""
     def __init__(self, entity_name: str, identifier: str | int):
         super().__init__(f"{entity_name} with ID '{identifier}' not found.")
+
+
+class CouponValidationException(CommerceException):
+    """Raised when a coupon code is expired, inactive, or invalid for an order."""
+    def __init__(self, reason: str):
+        super().__init__(f"Coupon validation failed: {reason}")
+        self.reason = reason

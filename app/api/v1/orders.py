@@ -9,10 +9,12 @@ from app.schemas.order import (
     OrderResponse,
     OrderStatusUpdate,
     OrderAnalyticsSummary,
+    OrderEventResponse,
 )
 from app.services.order_service import (
     create_order,
     update_order_status,
+    get_order_events,
     get_order_analytics_summary,
 )
 from app.core.security import get_current_active_user, get_current_admin_user
@@ -20,6 +22,7 @@ from app.core.exceptions import (
     InsufficientStockException,
     EntityNotFoundException,
     OrderStateTransitionException,
+    CouponValidationException,
 )
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
@@ -34,7 +37,7 @@ def place_order(
 ):
     """
     Places a new customer order and atomically reserves product inventory.
-    Supports optional 'Idempotency-Key' header for duplicate request protection.
+    Supports promo codes and optional 'Idempotency-Key' header for duplicate request protection.
     """
     try:
         order = create_order(
@@ -46,7 +49,7 @@ def place_order(
         return order
     except EntityNotFoundException as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=exc.message)
-    except InsufficientStockException as exc:
+    except (InsufficientStockException, CouponValidationException) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message)
 
 
@@ -97,6 +100,23 @@ def get_order_by_id(
     return order
 
 
+@router.get("/{order_id}/events", response_model=List[OrderEventResponse])
+def get_order_event_history(
+    order_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Retrieves immutable audit trail of state transitions for the specified order."""
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+    if not current_user.is_admin and order.user_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    return get_order_events(db=db, order_id=order_id)
+
+
 @router.post("/{order_id}/cancel", response_model=OrderResponse)
 def cancel_customer_order(
     order_id: int,
@@ -112,7 +132,13 @@ def cancel_customer_order(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     try:
-        updated = update_order_status(db=db, order=order, new_status=OrderStatus.CANCELLED)
+        updated = update_order_status(
+            db=db,
+            order=order,
+            new_status=OrderStatus.CANCELLED,
+            actor=f"user:{current_user.id}",
+            notes="Order cancelled by customer",
+        )
         return updated
     except OrderStateTransitionException as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message)
@@ -131,7 +157,13 @@ def set_order_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
     try:
-        updated = update_order_status(db=db, order=order, new_status=status_update.status)
+        updated = update_order_status(
+            db=db,
+            order=order,
+            new_status=status_update.status,
+            actor=f"admin:{_admin.id}",
+            notes=status_update.notes,
+        )
         return updated
     except OrderStateTransitionException as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message)

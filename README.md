@@ -68,53 +68,52 @@ The primary objectives of this repository are to demonstrate production-grade so
 
 ```text
 fastapi-orders-api/
-├── .github/
-│   └── workflows/
-│       └── ci.yml               # Automated CI pipeline for pull requests and pushes
+├── .github/workflows/ci.yml     # Automated CI pipeline (linting & pytest)
+├── alembic/                     # Database migrations & revision history
+│   ├── env.py                   # Migration environment linking SQLAlchemy Base metadata
+│   └── versions/                # Versioned migration revision scripts
 ├── app/
-│   ├── api/
-│   │   ├── __init__.py
-│   │   └── v1/
-│   │       ├── __init__.py      # v1 Router aggregator
-│   │       ├── auth.py          # /auth (register, login, me)
-│   │       ├── products.py      # /products (search, pagination, admin CRUD)
-│   │       ├── orders.py        # /orders (placement, history, cancel, status)
-│   │       └── webhooks.py      # /webhooks (asynchronous payment processor events)
+│   ├── api/v1/
+│   │   ├── __init__.py          # v1 Router aggregator
+│   │   ├── auth.py              # /auth (register, login, me)
+│   │   ├── coupons.py           # /coupons (promo code admin CRUD & customer validation)
+│   │   ├── orders.py            # /orders (checkout, idempotency, audit trail, analytics)
+│   │   ├── products.py          # /products (search, pagination, admin inventory)
+│   │   └── webhooks.py          # /webhooks (payment processor events)
 │   ├── core/
-│   │   ├── __init__.py
-│   │   ├── security.py          # OAuth2PasswordBearer & RBAC dependency guards
-│   │   └── exceptions.py        # Custom domain exceptions (CommerceException)
-│   ├── models/                  # SQLAlchemy ORM declarative entities
-│   │   ├── __init__.py
-│   │   ├── user.py              # User entity with hashed credentials and roles
+│   │   ├── exceptions.py        # Domain exceptions (CommerceException hierarchy)
+│   │   └── security.py          # OAuth2PasswordBearer, Bcrypt & RBAC guards
+│   ├── models/                  # SQLAlchemy ORM declarative models
+│   │   ├── coupon.py            # Coupon (percentage & fixed promo codes with limits)
+│   │   ├── order.py             # Order, OrderItem, OrderEvent (audit trail)
 │   │   ├── product.py           # Product catalog entity with stock levels
-│   │   └── order.py             # Order and OrderItem entities with OrderStatus enum
-│   ├── schemas/                 # Pydantic v2 data transfer objects (DTOs)
-│   │   ├── __init__.py
-│   │   ├── user.py              # Registration, login, and user profile schemas
-│   │   ├── product.py           # Catalog filter, creation, and response schemas
-│   │   └── order.py             # Order placement, item nested schemas, status update
-│   ├── services/                # Encapsulated domain business logic
-│   │   ├── __init__.py
-│   │   ├── auth_service.py      # Bcrypt hashing and JWT encoding/decoding
-│   │   └── order_service.py     # Atomic checkout and state machine orchestration
-│   ├── config.py                # Pydantic-settings global environment configuration
-│   ├── database.py              # Engine setup, session pooling, and get_db dependency
-│   └── main.py                  # Application factory, lifespan, CORS, and exception handlers
+│   │   └── user.py              # User entity with hashed credentials and roles
+│   ├── schemas/                 # Pydantic v2 DTOs (validation & serialization)
+│   │   ├── coupon.py            # Coupon validation, creation, and calculation schemas
+│   │   ├── order.py             # OrderCreate, OrderResponse, OrderEventResponse
+│   │   ├── product.py           # ProductCreate, ProductResponse
+│   │   └── user.py              # UserRegister, UserLogin, UserResponse
+│   ├── services/
+│   │   ├── auth_service.py      # JWT encoding/decoding & credential verification
+│   │   └── order_service.py     # Atomic checkout, coupon discounts, state machine & FSM
+│   ├── config.py                # Pydantic-settings environment variables
+│   ├── database.py              # SQLite WAL mode, connection pooling & get_db
+│   └── main.py                  # FastAPI factory, telemetry middleware & exception handlers
 ├── tests/
-│   ├── __init__.py
-│   ├── conftest.py              # Pytest in-memory database fixtures & auth headers
-│   ├── test_auth.py             # Authentication & token verification tests
-│   ├── test_products.py         # Catalog search, pagination, and RBAC tests
-│   └── test_orders.py           # Atomic inventory deduction, FSM, and webhook tests
-├── scripts/
-│   └── seed_data.py             # Development database seeder with sample catalog
-├── .env.example                 # Template for local environment variables
-├── .gitignore                   # Git exclusion rules for compiled artifacts & virtualenvs
+│   ├── conftest.py              # Shared fixtures, auth tokens & in-memory SQLite isolation
+│   ├── test_analytics_and_idempotency.py # Idempotency-Key guard & SQL GMV aggregations
+│   ├── test_auth.py             # Authentication, duplicate registration & JWT validation
+│   ├── test_concurrency.py      # Multithreaded stress test & atomic stock deduction
+│   ├── test_coupons_and_events.py # Promo engine, expiration, limits & audit history
+│   ├── test_health.py           # Liveness & database connection pool readiness probes
+│   ├── test_orders.py           # Checkout, inventory rollback on cancel & webhook sync
+│   └── test_products.py         # Catalog search, filtering & RBAC authorization
+├── Makefile                     # Standard developer commands (test, test-cov, dev, migrate)
+├── alembic.ini                  # Alembic CLI migration configuration
 ├── Dockerfile                   # Multi-stage production container build
-├── docker-compose.yml           # Local production-mirror (FastAPI + PostgreSQL 15)
-├── pytest.ini                   # Pytest configuration and pythonpath discovery
-└── requirements.txt             # Pinned production and test dependencies
+├── docker-compose.yml           # Production-mirror container orchestration
+├── pytest.ini                   # Pytest testpaths and discovery configuration
+└── requirements.txt             # Pinned production and testing dependencies
 ```
 
 ---
@@ -135,9 +134,23 @@ for item in order_in.items:
     if product.stock < item.quantity:
         raise InsufficientStockException(product.name, product.stock, item.quantity)
 
-# 3. Atomically decrement inventory and persist Order + OrderItems
+# 3. Atomically reserve inventory at database level (optimistic concurrency guard)
+# UPDATE products SET stock = stock - :qty WHERE id = :id AND stock >= :qty
 for item in order_in.items:
-    product.stock -= item.quantity
+    rows_updated = (
+        db.query(Product)
+        .filter(
+            Product.id == item.product_id,
+            Product.stock >= item.quantity,
+            Product.is_active.is_(True),
+        )
+        .update(
+            {Product.stock: Product.stock - item.quantity},
+            synchronize_session="fetch",
+        )
+    )
+    if rows_updated == 0:
+        raise InsufficientStockException(product.name, product.stock, item.quantity)
     db.add(OrderItem(...))
 
 db.commit()
@@ -392,37 +405,57 @@ engine = create_engine(
 )
 ```
 
-### Running the Test Suite
+### Running the Test Suite & Coverage
+
+The automated test suite contains **30 tests** covering unit validations, security RBAC boundaries, idempotent checkout retries, promo coupon constraints, order event logs, and **multithreaded race condition simulation**.
 
 ```bash
-pytest -v
+# Run all tests
+make test
+# Or: pytest -v
+
+# Run with test coverage report (89% coverage)
+make test-cov
 ```
 
-*Output:*
+*Test Execution Summary:*
 ```text
 ============================= test session starts =============================
 platform win32 -- Python 3.11.9, pytest-9.1.1, pluggy-1.7.0
 rootdir: C:\xampp\htdocs\fastapi-orders-api
 configfile: pytest.ini
-collected 15 items
+testpaths: tests
+plugins: anyio-4.15.1, cov-7.1.0
+collected 30 items
 
-tests/test_auth.py::test_register_user_success PASSED                    [  6%]
-tests/test_auth.py::test_register_duplicate_email_fails PASSED           [ 13%]
-tests/test_auth.py::test_login_success PASSED                            [ 20%]
-tests/test_auth.py::test_login_wrong_password_fails PASSED               [ 26%]
-tests/test_auth.py::test_read_me_profile PASSED                          [ 33%]
-tests/test_orders.py::test_place_order_success_deducts_inventory PASSED  [ 40%]
-tests/test_orders.py::test_place_order_insufficient_stock_fails PASSED   [ 46%]
-tests/test_orders.py::test_cancel_order_restores_inventory PASSED        [ 53%]
-tests/test_orders.py::test_illegal_status_transition_fails PASSED        [ 60%]
-tests/test_orders.py::test_payment_webhook_marks_order_paid PASSED       [ 66%]
-tests/test_products.py::test_list_products_empty PASSED                  [ 73%]
-tests/test_products.py::test_list_products_with_items PASSED             [ 80%]
-tests/test_products.py::test_search_product_by_query PASSED              [ 86%]
-tests/test_products.py::test_create_product_admin_only PASSED            [ 93%]
-tests/test_products.py::test_update_product_stock_admin PASSED           [100%]
+tests/test_analytics_and_idempotency.py ....                             [ 13%]
+tests/test_auth.py .....                                                 [ 30%]
+tests/test_concurrency.py ...                                            [ 40%]
+tests/test_coupons_and_events.py ......                                  [ 60%]
+tests/test_health.py ..                                                  [ 66%]
+tests/test_orders.py .....                                               [ 83%]
+tests/test_products.py .....                                             [100%]
 
-======================== 15 passed, 1 warning in 3.42s ========================
+=============================== tests coverage ================================
+Name                            Stmts   Miss  Cover
+---------------------------------------------------
+app/api/v1/__init__.py             12      0   100%
+app/api/v1/auth.py                 31      1    97%
+app/api/v1/coupons.py              40      8    80%
+app/api/v1/orders.py               67     14    79%
+app/api/v1/products.py             45      7    84%
+app/config.py                      23      2    91%
+app/core/exceptions.py             20      1    95%
+app/core/security.py               28      4    86%
+app/database.py                    21      4    81%
+app/main.py                        45      4    91%
+app/models/coupon.py               40      3    92%
+app/models/order.py                54      2    96%
+app/schemas/order.py               58      0   100%
+app/services/order_service.py      91      6    93%
+---------------------------------------------------
+TOTAL                             751     82    89%
+======================== 30 passed in ~9.5s ========================
 ```
 
 ---

@@ -13,15 +13,15 @@ from app.core.exceptions import CommerceException
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create DB tables automatically on startup if using SQLite/local dev
+    # Auto-create tables for development/testing SQLite
     Base.metadata.create_all(bind=engine)
     yield
 
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="High-performance e-commerce order management microservice with atomic stock reservation and analytics.",
-    version="1.2.0",
+    description="High-performance e-commerce order management microservice with atomic stock reservation, promo engine, and lifecycle telemetry.",
+    version="1.3.0",
     openapi_url=f"{settings.API_V1_STR}/openapi.json",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -55,9 +55,12 @@ if settings.CORS_ORIGINS:
 async def commerce_exception_handler(request: Request, exc: CommerceException):
     return JSONResponse(
         status_code=status.HTTP_400_BAD_REQUEST,
-        content={"error": exc.__class__.__name__, "message": exc.message},
+        content={
+            "error": exc.__class__.__name__,
+            "message": exc.message,
+            "detail": exc.message,
+        },
     )
-
 
 
 @app.get("/health/db", tags=["Health"])
@@ -70,6 +73,7 @@ def database_health_check():
         return {"status": "healthy", "database": "connected"}
     except Exception as exc:
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(exc)})
+
 
 @app.get("/health", tags=["Health"])
 def health_check():
@@ -89,12 +93,4 @@ def root_info():
 
 
 # Mount API v1
-
-@app.middleware("http")
-async def add_correlation_id(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
-
 app.include_router(api_router, prefix=settings.API_V1_STR)
