@@ -12,6 +12,12 @@ class Settings(BaseSettings):
     # Database
     DATABASE_URL: str = "sqlite:///./orders.db"
 
+    # Redis & Asynchronous Task Queue with Dead Letter Queue (DLQ)
+    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_QUEUE_NAME: str = "orders:tasks"
+    REDIS_DLQ_NAME: str = "orders:dlq"
+    MAX_TASK_RETRIES: int = 3
+
     # JWT Authentication
     SECRET_KEY: str = "change-this-in-production-use-openssl-rand-hex-32"
     ALGORITHM: str = "HS256"

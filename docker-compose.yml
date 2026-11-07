@@ -8,16 +8,39 @@ services:
       - "8000:8000"
     environment:
       - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/nova_commerce
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_QUEUE_NAME=orders:tasks
+      - REDIS_DLQ_NAME=orders:dlq
       - SECRET_KEY=super-secret-dev-key-change-in-production
       - DEBUG=True
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+
+  worker:
+    build: .
+    container_name: nova_commerce_worker
+    command: python -m app.tasks.worker
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://postgres:postgres@db:5432/nova_commerce
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_QUEUE_NAME=orders:tasks
+      - REDIS_DLQ_NAME=orders:dlq
+      - SECRET_KEY=super-secret-dev-key-change-in-production
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ./app:/app/app
 
   db:
-    image: postgres:15-alpine
+    image: postgres:16-alpine
     container_name: nova_commerce_db
     environment:
       - POSTGRES_USER=postgres
@@ -33,5 +56,20 @@ services:
       timeout: 5s
       retries: 5
 
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    container_name: nova_commerce_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
 volumes:
   postgres_data:
+  redis_data:

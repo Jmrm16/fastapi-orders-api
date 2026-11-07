@@ -10,6 +10,31 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_nova_commerce
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
     - uses: actions/checkout@v3
 
@@ -24,6 +49,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run Pytest test suite
+    - name: Run Pytest test suite with real PostgreSQL and Redis services
+      env:
+        DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/test_nova_commerce
+        REDIS_URL: redis://localhost:6379/0
       run: |
-        pytest -v --tb=short
+        pytest -v --cov=app --cov-report=term-missing --cov-fail-under=89

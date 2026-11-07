@@ -87,31 +87,52 @@ def create_order(
     net_total = round(max(0.0, subtotal - discount_amount), 2)
 
     # 5. Atomic inventory reservation:
-    # Uses conditional UPDATE WHERE stock >= requested to guarantee zero overselling
-    # even under concurrent thread execution.
+    # Under PostgreSQL, uses pessimistic row locking (SELECT ... FOR UPDATE via with_for_update())
+    # to serialize concurrent transactions and prevent overselling under high concurrency.
+    # On SQLite (used for rapid isolated unit testing), executes atomic conditional updates (WHERE stock >= requested).
     for item in order_in.items:
-        rows_updated = (
-            db.query(Product)
-            .filter(
-                Product.id == item.product_id,
-                Product.stock >= item.quantity,
-                Product.is_active.is_(True),
+        if db.bind and getattr(db.bind.dialect, "name", "") == "postgresql":
+            # PostgreSQL Pessimistic Row Lock with fresh database state
+            locked_product = (
+                db.query(Product)
+                .filter(Product.id == item.product_id)
+                .with_for_update()
+                .populate_existing()
+                .first()
             )
-            .update(
-                {Product.stock: Product.stock - item.quantity},
-                synchronize_session="fetch",
+            if not locked_product or not locked_product.is_active or locked_product.stock < item.quantity:
+                avail = locked_product.stock if locked_product else 0
+                name = locked_product.name if locked_product else f"Product #{item.product_id}"
+                raise InsufficientStockException(
+                    product_name=name,
+                    available=avail,
+                    requested=item.quantity,
+                )
+            locked_product.stock -= item.quantity
+        else:
+            # SQLite Atomic Conditional Update fallback
+            rows_updated = (
+                db.query(Product)
+                .filter(
+                    Product.id == item.product_id,
+                    Product.stock >= item.quantity,
+                    Product.is_active.is_(True),
+                )
+                .update(
+                    {Product.stock: Product.stock - item.quantity},
+                    synchronize_session="fetch",
+                )
             )
-        )
-        if rows_updated == 0:
-            # Atomic update failed: insufficient inventory
-            current_p = db.query(Product).filter(Product.id == item.product_id).first()
-            avail = current_p.stock if current_p else 0
-            name = current_p.name if current_p else f"Product #{item.product_id}"
-            raise InsufficientStockException(
-                product_name=name,
-                available=avail,
-                requested=item.quantity,
-            )
+            if rows_updated == 0:
+                # Atomic update failed: insufficient inventory
+                current_p = db.query(Product).filter(Product.id == item.product_id).first()
+                avail = current_p.stock if current_p else 0
+                name = current_p.name if current_p else f"Product #{item.product_id}"
+                raise InsufficientStockException(
+                    product_name=name,
+                    available=avail,
+                    requested=item.quantity,
+                )
 
     # 6. Create order record
     order = Order(
@@ -150,6 +171,22 @@ def create_order(
 
     db.commit()
     db.refresh(order)
+
+    # 9. Asynchronously enqueue post-order creation event to Redis Task Queue
+    try:
+        from app.services.queue_service import enqueue_task
+        enqueue_task(
+            task_type="ORDER_CREATED",
+            payload={
+                "order_id": order.id,
+                "user_id": user.id,
+                "total_amount": float(order.total_amount),
+                "shipping_address": order.shipping_address,
+            },
+        )
+    except Exception:
+        pass
+
     return order
 
 
@@ -202,6 +239,22 @@ def update_order_status(
 
     db.commit()
     db.refresh(order)
+
+    # Dispatch status change event to Redis Task Queue
+    try:
+        from app.services.queue_service import enqueue_task
+        enqueue_task(
+            task_type="ORDER_STATUS_CHANGED",
+            payload={
+                "order_id": order.id,
+                "old_status": old_status.value,
+                "new_status": new_status.value,
+                "actor": actor,
+            },
+        )
+    except Exception:
+        pass
+
     return order
 
 

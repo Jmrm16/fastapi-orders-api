@@ -17,6 +17,7 @@ from app.services.order_service import (
     get_order_events,
     get_order_analytics_summary,
 )
+from app.services.queue_service import get_dlq_tasks, reprocess_dlq_task
 from app.core.security import get_current_active_user, get_current_admin_user
 from app.core.exceptions import (
     InsufficientStockException,
@@ -167,3 +168,33 @@ def set_order_status(
         return updated
     except OrderStateTransitionException as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=exc.message)
+
+
+@router.get("/tasks/dlq", response_model=List[dict])
+def list_dead_letter_queue_tasks(
+    limit: int = 50,
+    _admin: User = Depends(get_current_admin_user),
+):
+    """
+    Retrieves poisoned and failed asynchronous tasks currently residing in the Redis Dead Letter Queue (DLQ).
+    Requires administrative permissions.
+    """
+    return get_dlq_tasks(limit=limit)
+
+
+@router.post("/tasks/dlq/{task_id}/reprocess", status_code=status.HTTP_200_OK)
+def replay_dead_letter_queue_task(
+    task_id: str,
+    _admin: User = Depends(get_current_admin_user),
+):
+    """
+    Requeues a failed task from the Dead Letter Queue back into the active processing queue.
+    Requires administrative permissions.
+    """
+    success = reprocess_dlq_task(task_id=task_id)
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task '{task_id}' not found in Dead Letter Queue",
+        )
+    return {"message": f"Task '{task_id}' successfully requeued for execution", "task_id": task_id}

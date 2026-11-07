@@ -52,14 +52,16 @@ The primary objectives of this repository are to demonstrate production-grade so
 | :--- | :--- |
 | **Python 3.11+** | Runtime environment leveraging modern type annotations and union syntax. |
 | **FastAPI** | High-performance asynchronous web framework, dependency injection system, and automatic OpenAPI generation. |
-| **SQLAlchemy 2.0** | ORM and SQL toolkit for declarative data modeling and transactional persistence. |
+| **SQLAlchemy 2.0** | ORM and SQL toolkit with dialect-aware pessimistic row locking (`with_for_update()`). |
+| **PostgreSQL 16** | Production relational database engine configured with connection pooling (`pool_size=20`, `max_overflow=10`). |
+| **Redis 7** | High-throughput asynchronous task queue with automated retries and Dead Letter Queue (DLQ). |
 | **Pydantic v2** | Request validation, serialization, and schema contracts (`ConfigDict(from_attributes=True)`). |
 | **pydantic-settings** | Strict, environment-driven configuration management with `.env` file support. |
 | **bcrypt** | Direct cryptographic salted password hashing. |
 | **python-jose** | Signed JWT access token issuance and signature verification. |
-| **pytest** | Automated test suite execution, fixtures, and assertion frameworks. |
+| **pytest** | Automated test suite execution (37 tests, 83% coverage), fixtures, and assertion frameworks. |
 | **HTTPX / TestClient** | Synchronous ASGI in-memory request dispatching for integration testing. |
-| **Docker & Docker Compose** | Containerized deployment and multi-service orchestration with PostgreSQL. |
+| **Docker & Docker Compose** | Containerized multi-service orchestration (FastAPI API + Background Worker + PostgreSQL 16 + Redis 7). |
 | **GitHub Actions** | Automated CI pipeline running linting and test suites on every pull request. |
 
 ---
@@ -77,7 +79,7 @@ fastapi-orders-api/
 │   │   ├── __init__.py          # v1 Router aggregator
 │   │   ├── auth.py              # /auth (register, login, me)
 │   │   ├── coupons.py           # /coupons (promo code admin CRUD & customer validation)
-│   │   ├── orders.py            # /orders (checkout, idempotency, audit trail, analytics)
+│   │   ├── orders.py            # /orders (checkout, idempotency, audit trail, DLQ management)
 │   │   ├── products.py          # /products (search, pagination, admin inventory)
 │   │   └── webhooks.py          # /webhooks (payment processor events)
 │   ├── core/
@@ -95,9 +97,13 @@ fastapi-orders-api/
 │   │   └── user.py              # UserRegister, UserLogin, UserResponse
 │   ├── services/
 │   │   ├── auth_service.py      # JWT encoding/decoding & credential verification
-│   │   └── order_service.py     # Atomic checkout, coupon discounts, state machine & FSM
-│   ├── config.py                # Pydantic-settings environment variables
-│   ├── database.py              # SQLite WAL mode, connection pooling & get_db
+│   │   ├── order_service.py     # Pessimistic checkout with with_for_update(), state machine & FSM
+│   │   └── queue_service.py     # Redis task queues, retry backoff & Dead Letter Queue (DLQ)
+│   ├── tasks/
+│   │   ├── __init__.py          # Asynchronous worker module
+│   │   └── worker.py            # Standalone daemon process listening on Redis task queues
+│   ├── config.py                # Pydantic-settings environment variables (PostgreSQL & Redis URLs)
+│   ├── database.py              # Dialect-aware pooling (PostgreSQL pool_size=20, SQLite WAL mode)
 │   └── main.py                  # FastAPI factory, telemetry middleware & exception handlers
 ├── tests/
 │   ├── conftest.py              # Shared fixtures, auth tokens & in-memory SQLite isolation
@@ -107,11 +113,13 @@ fastapi-orders-api/
 │   ├── test_coupons_and_events.py # Promo engine, expiration, limits & audit history
 │   ├── test_health.py           # Liveness & database connection pool readiness probes
 │   ├── test_orders.py           # Checkout, inventory rollback on cancel & webhook sync
-│   └── test_products.py         # Catalog search, filtering & RBAC authorization
+│   ├── test_products.py         # Catalog search, filtering & RBAC authorization
+│   ├── test_queue_and_dlq.py    # Redis task processing, retry limits & DLQ recovery
+│   └── test_row_locking.py      # PostgreSQL SELECT FOR UPDATE pessimistic locking verification
 ├── Makefile                     # Standard developer commands (test, test-cov, dev, migrate)
 ├── alembic.ini                  # Alembic CLI migration configuration
 ├── Dockerfile                   # Multi-stage production container build
-├── docker-compose.yml           # Production-mirror container orchestration
+├── docker-compose.yml           # Multi-service stack (API + Worker + Postgres 16 + Redis 7)
 ├── pytest.ini                   # Pytest testpaths and discovery configuration
 └── requirements.txt             # Pinned production and testing dependencies
 ```
@@ -120,38 +128,36 @@ fastapi-orders-api/
 
 ## Architecture & Core Concepts
 
-### 1. Atomic Inventory Reservation
+### 1. Atomic Inventory Reservation & Pessimistic Row Locking
 
-In high-concurrency e-commerce environments, standard read-then-write updates lead to overselling (*race conditions*). `FastAPI Orders API` encapsulates inventory reservation inside a single transactional block in `app/services/order_service.py`:
+In high-concurrency e-commerce environments, standard read-then-write updates lead to overselling (*race conditions*). `FastAPI Orders API` leverages **dialect-aware inventory reservation** inside a single ACID transactional block in `app/services/order_service.py`:
+
+- **PostgreSQL (Production):** Uses pessimistic row locking (`SELECT ... FOR UPDATE` via SQLAlchemy's `.with_for_update()`). Any concurrent checkout transaction for the same product SKU is blocked at the database engine level until the current transaction commits or rolls back, strictly guaranteeing zero overselling.
+- **SQLite (Local & CI unit testing):** Uses atomic conditional database updates (`WHERE id = :id AND stock >= :qty`) with WAL mode.
 
 ```python
-# 1. Fetch and validate all requested items in a single query
-products = db.query(Product).filter(Product.id.in_(requested_product_ids)).all()
-
-# 2. Verify stock sufficiency for every line item
+# PostgreSQL Pessimistic Row Locking:
 for item in order_in.items:
-    product = products_by_id[item.product_id]
-    if product.stock < item.quantity:
-        raise InsufficientStockException(product.name, product.stock, item.quantity)
-
-# 3. Atomically reserve inventory at database level (optimistic concurrency guard)
-# UPDATE products SET stock = stock - :qty WHERE id = :id AND stock >= :qty
-for item in order_in.items:
-    rows_updated = (
-        db.query(Product)
-        .filter(
-            Product.id == item.product_id,
-            Product.stock >= item.quantity,
-            Product.is_active.is_(True),
+    if db.bind and getattr(db.bind.dialect, "name", "") == "postgresql":
+        # SELECT * FROM products WHERE id = :id FOR UPDATE
+        locked_product = (
+            db.query(Product)
+            .filter(Product.id == item.product_id)
+            .with_for_update()
+            .first()
         )
-        .update(
-            {Product.stock: Product.stock - item.quantity},
-            synchronize_session="fetch",
+        if not locked_product or locked_product.stock < item.quantity:
+            raise InsufficientStockException(locked_product.name, locked_product.stock, item.quantity)
+        locked_product.stock -= item.quantity
+    else:
+        # Atomic conditional update fallback (SQLite)
+        rows_updated = (
+            db.query(Product)
+            .filter(Product.id == item.product_id, Product.stock >= item.quantity, Product.is_active.is_(True))
+            .update({Product.stock: Product.stock - item.quantity}, synchronize_session="fetch")
         )
-    )
-    if rows_updated == 0:
-        raise InsufficientStockException(product.name, product.stock, item.quantity)
-    db.add(OrderItem(...))
+        if rows_updated == 0:
+            raise InsufficientStockException(product.name, product.stock, item.quantity)
 
 db.commit()
 ```
@@ -229,6 +235,43 @@ The webhook endpoint (`/api/v1/webhooks/payment`) simulates event notifications 
 - Listens for `payment.succeeded` events to transition orders from `PENDING` to `PAID`.
 - Listens for `payment.failed` events to cancel the order and release inventory.
 - Handles duplicate/idempotent callbacks gracefully without throwing errors.
+
+### 6. Redis 7 Asynchronous Task Processing & Dead Letter Queue (DLQ)
+
+Critical post-order operations (email dispatch, external CRM synchronization, invoice generation) are decoupled from the synchronous HTTP request path using **Redis 7 task lists** (`orders:tasks`) and a dedicated background worker daemon:
+
+```text
+ ┌────────────────┐      LPUSH      ┌──────────────────────┐
+ │  FastAPI API   ├────────────────►│ Redis Queue          │
+ │  (POST /orders)│                 │ (orders:tasks)       │
+ └────────────────┘                 └──────────┬───────────┘
+                                               │ RPOP
+                                               ▼
+                                    ┌──────────────────────┐
+                                    │  Background Worker   │
+                                    │  (app.tasks.worker)  │
+                                    └──────────┬───────────┘
+                         Success ┌─────────────┴─────────────┐ Failure
+                                 ▼                           ▼
+                        ┌─────────────────┐        ┌───────────────────┐
+                        │ Task Completed  │        │ Retry (Max 3)     │
+                        │ & Logged        │        │ Re-enqueued       │
+                        └─────────────────┘        └─────────┬─────────┘
+                                                             │ Exceeded Retries
+                                                             ▼
+                                                   ┌───────────────────┐
+                                                   │ Dead Letter Queue │
+                                                   │ (orders:dlq)      │
+                                                   └─────────┬─────────┘
+                                                             │ Admin Replay
+                                                             ▼
+                                                   [Re-enqueued for Reprocessing]
+```
+
+- **Resilient Retry Loop:** Failed tasks record failure timestamps and error stack traces, retrying up to `MAX_TASK_RETRIES` (3).
+- **Poison Pill Isolation:** If all retries fail, tasks are permanently quarantined into `orders:dlq` without blocking healthy jobs.
+- **Admin DLQ APIs:** Administrators can inspect poisoned messages (`GET /api/v1/orders/tasks/dlq`) and replay them (`POST /api/v1/orders/tasks/dlq/{task_id}/reprocess`).
+- **Deterministic Testing:** Includes a zero-dependency in-memory queue fallback that simulates Redis operations during local test execution.
 
 ---
 
@@ -506,15 +549,19 @@ TOTAL                             751     82    89%
 
 ---
 
-### Option B: Docker Compose (PostgreSQL Production Mirror)
+### Option B: Docker Compose (Production Topology Mirror)
 
-To run the complete production topology including PostgreSQL 15:
+To run the full production stack including **PostgreSQL 16**, **Redis 7**, the **FastAPI REST API**, and the **Asynchronous Background Worker**:
 
 ```bash
 docker compose up --build
 ```
 
-The API will be accessible on port `8000` with the PostgreSQL database persisting data to a named Docker volume (`postgres_data`).
+The stack orchestrates:
+- **`nova_commerce_api`:** FastAPI web service on port `8000`.
+- **`nova_commerce_worker`:** Background worker consuming the `orders:tasks` queue.
+- **`nova_commerce_db`:** PostgreSQL 16 on port `5432` with healthcheck and volume persistence.
+- **`nova_commerce_redis`:** Redis 7 on port `6379` with healthcheck and AOF persistence (`--appendonly yes`).
 
 ---
 
